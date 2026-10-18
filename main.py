@@ -13,7 +13,7 @@ import time
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-APP_VERSION = "1.4"
+APP_VERSION = "2.0"
 
 # 自訂下拉式選單
 class ScrollableComboBox(ctk.CTkFrame):
@@ -164,21 +164,88 @@ def get_mojang_java_version(mc_version):
         print(f"[Mojang Java版本取得失敗]: {e}")
     return None
 
-# 自動比對取得所需 Java 版本（若為 Paper 則比對 Paper 與 Mojang API，取最高者確保相容）
-def get_required_java_version(mc_version, server_type="Paper"):
+# 透過 NeoForge POM 檔案精準解析對應的 Minecraft 版本
+def get_neoforge_mc_version(neoforge_version):
+    try:
+        url = f"https://maven.neoforged.net/releases/net/neoforged/neoforge/{neoforge_version}/neoforge-{neoforge_version}.pom"
+        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        if resp.status_code == 200:
+            import re
+            m = re.search(r'<artifactId>neoform</artifactId>\s*<version>([^<]+)', resp.text)
+            if m:
+                neoform_ver = m.group(1).split("-")[0]
+                print(f"[NeoForge 解析] 版本 {neoforge_version} 對應 neoform 版本為 {neoform_ver}")
+                return neoform_ver
+    except Exception as e:
+        print(f"[NeoForge MC版本解析失敗]: {e}")
+
+    # 本地備援規則推算
+    parts = neoforge_version.split(".")
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        maj = int(parts[0])
+        min_v = int(parts[1])
+        if maj >= 26:
+            return f"1.{maj}.{min_v}"
+        elif maj >= 20:
+            return f"1.{maj}.{min_v}"
+        else:
+            return f"1.{maj}"
+    return neoforge_version
+
+# 取得 NeoForge 官方指定的 Java 最低需求版本 (來自 NeoForge maven module 元資料)
+def get_neoforge_java_version(version_str):
+    try:
+        url = f"https://maven.neoforged.net/releases/net/neoforged/neoforge/{version_str}/neoforge-{version_str}.module"
+        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        if resp.status_code == 200:
+            mod = resp.json()
+            jvm_vers = [
+                v.get('attributes', {}).get('org.gradle.jvm.version')
+                for v in mod.get('variants', [])
+                if v.get('attributes', {}).get('org.gradle.jvm.version')
+            ]
+            if jvm_vers:
+                return int(max(jvm_vers))
+    except Exception as e:
+        print(f"[NeoForge Java版本取得失敗]: {e}")
+    return None
+
+# 自動比對取得所需 Java 版本（依據伺服器類型對照 Paper/NeoForge 與 Mojang API，取最高者確保相容）
+def get_required_java_version(version, server_type="Paper"):
+    if server_type == "NeoForge":
+        mc_version = get_neoforge_mc_version(version)
+    else:
+        mc_version = version
+
     mojang_ver = get_mojang_java_version(mc_version)
     paper_ver = get_paper_java_version(mc_version) if server_type == "Paper" else None
+    neoforge_ver = get_neoforge_java_version(version) if server_type == "NeoForge" else None
 
-    print(f"[Java版本對照] 版本: {mc_version} ({server_type}) | Mojang: {mojang_ver} | Paper: {paper_ver}")
+    print(f"[Java版本對照] 版本: {version} ({server_type}, 對應MC: {mc_version}) | Mojang: {mojang_ver} | Paper: {paper_ver} | NeoForge: {neoforge_ver}")
 
-    if paper_ver and mojang_ver:
-        # 兩者皆有取得，對照後取較高（嚴格）版本
-        chosen_ver = max(paper_ver, mojang_ver)
-        print(f"[Java版本] 對照後決定採用 Java {chosen_ver}")
-        return chosen_ver
-    elif paper_ver:
-        print(f"[Java版本] 採用 Paper API 指定的 Java {paper_ver}")
-        return paper_ver
+    # Paper 伺服器
+    if server_type == "Paper":
+        if paper_ver and mojang_ver:
+            chosen = max(paper_ver, mojang_ver)
+            print(f"[Java版本] Paper 與 Mojang 對照後決定採用 Java {chosen}")
+            return chosen
+        elif paper_ver:
+            return paper_ver
+        elif mojang_ver:
+            return mojang_ver
+
+    # NeoForge 伺服器
+    elif server_type == "NeoForge":
+        if neoforge_ver and mojang_ver:
+            chosen = max(neoforge_ver, mojang_ver)
+            print(f"[Java版本] NeoForge 與 Mojang 對照後決定採用 Java {chosen}")
+            return chosen
+        elif neoforge_ver:
+            return neoforge_ver
+        elif mojang_ver:
+            return mojang_ver
+
+    # Vanilla 或其他伺服器
     elif mojang_ver:
         print(f"[Java版本] 採用 Mojang API 指定的 Java {mojang_ver}")
         return mojang_ver
@@ -356,6 +423,118 @@ def get_vanilla_versions():
         show_error("版本取得失敗", f"抓取 Vanilla 版本資訊時發生錯誤：{e}")
         return []
 
+# 取得可用的 NeoForge 版本列表
+def get_neoforge_versions():
+    try:
+        response = requests.get("https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml", headers={'User-Agent': 'Mozilla/5.0'})
+        response.raise_for_status()
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(response.text)
+        versions = []
+        for version_elem in root.findall(".//version"):
+            version = version_elem.text
+            if version and not version.endswith("-SNAPSHOT"):
+                versions.append(version)
+        def version_key(v):
+            parts = v.replace('-rc', '.rc').replace('-pre', '.pre').split('.')
+            result = []
+            for part in parts:
+                if part.isdigit():
+                    result.append(int(part))
+                elif part.startswith('rc') and part[2:].isdigit():
+                    result.append(-1)
+                    result.append(int(part[2:]))
+                elif part.startswith('pre') and part[3:].isdigit():
+                    result.append(-2)
+                    result.append(int(part[3:]))
+                else:
+                    result.append(part)
+            return result
+        versions.sort(key=version_key, reverse=True)
+        return versions
+    except Exception as e:
+        show_error("版本取得失敗", f"抓取 NeoForge 版本資訊時發生錯誤：{e}")
+        return []
+
+# 取得可用的 Forge 版本列表 (Minecraft 支援版本)
+def get_forge_versions():
+    try:
+        response = requests.get("https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json", headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        response.raise_for_status()
+        promos = response.json().get("promos", {})
+        mc_set = set()
+        for k in promos.keys():
+            mc_v = k.replace("-latest", "").replace("-recommended", "")
+            if mc_v:
+                mc_set.add(mc_v)
+
+        def version_key(v):
+            parts = v.split(".")
+            result = []
+            for p in parts:
+                if p.isdigit():
+                    result.append(int(p))
+                else:
+                    result.append(p)
+            return result
+
+        versions = sorted(list(mc_set), key=version_key, reverse=True)
+        return versions
+    except Exception as e:
+        show_error("版本取得失敗", f"抓取 Forge 版本資訊時發生錯誤：{e}")
+        return []
+
+# 取得 Forge 伺服器安裝檔 (installer.jar) 下載連結
+def get_forge_server_url(mc_version):
+    try:
+        response = requests.get("https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json", headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        response.raise_for_status()
+        promos = response.json().get("promos", {})
+        forge_build = promos.get(f"{mc_version}-recommended") or promos.get(f"{mc_version}-latest")
+        if not forge_build:
+            return None
+        full_ver = f"{mc_version}-{forge_build}"
+        return f"https://maven.minecraftforge.net/net/minecraftforge/forge/{full_ver}/forge-{full_ver}-installer.jar"
+    except Exception as e:
+        print(f"[Forge 下載連結解析失敗]: {e}")
+        return None
+
+# 取得可用的 Fabric 版本列表
+def get_fabric_versions():
+    try:
+        response = requests.get("https://meta.fabricmc.net/v2/versions/game", headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        response.raise_for_status()
+        games = response.json()
+        versions = [g["version"] for g in games if g.get("stable")]
+        return versions
+    except Exception as e:
+        show_error("版本取得失敗", f"抓取 Fabric 版本資訊時發生錯誤：{e}")
+        return []
+
+# 取得 Fabric 伺服器 jar (包含 installer 與 loader) 下載連結
+def get_fabric_server_url(mc_version):
+    try:
+        # 取得最新 loader 與 installer 版本
+        loader_resp = requests.get(f"https://meta.fabricmc.net/v2/versions/loader/{mc_version}", headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        loader_resp.raise_for_status()
+        loader_list = loader_resp.json()
+        if not loader_list:
+            return None
+        loader_ver = loader_list[0]["loader"]["version"]
+
+        inst_resp = requests.get("https://meta.fabricmc.net/v2/versions/installer", headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        inst_resp.raise_for_status()
+        installer_ver = inst_resp.json()[0]["version"]
+
+        return f"https://meta.fabricmc.net/v2/versions/loader/{mc_version}/{loader_ver}/{installer_ver}/server/jar"
+    except Exception as e:
+        print(f"[Fabric 下載連結解析失敗]: {e}")
+        return None
+
+# 取得 NeoForge 伺服器安裝檔 (installer.jar) 下載連結
+def get_neoforge_server_url(neoforge_version):
+    return f"https://maven.neoforged.net/releases/net/neoforged/neoforge/{neoforge_version}/neoforge-{neoforge_version}-installer.jar"
+
 # 寫入 eula.txt
 def create_or_update_eula_file(agree: bool, folder_path: str):
     if not folder_path:
@@ -367,25 +546,78 @@ def create_or_update_eula_file(agree: bool, folder_path: str):
     except Exception as e:
         show_error("EULA 檔案錯誤", f"寫入 EULA 檔案失敗：{e}")
 
-# 建立 start.bat 啟動腳本
-def create_start_bat(folder_path, min_memory, max_memory, use_gui, java_path=None):
+# 建立 start.bat 啟動腳本 (支援 NeoForge 與標準 server.jar)
+def create_start_bat(folder_path, min_memory, max_memory, use_gui, java_path=None, server_type="Paper"):
     if not folder_path:
         show_error("安裝路徑錯誤", "請先選擇安裝路徑")
         return
     try:
-        bat_path = os.path.join(folder_path, "start.bat")
-        with open(bat_path, "w", encoding="utf-8") as f:
-            f.write("@echo off\n")
-            f.write(f'"{java_path if java_path else "java"}" -Xms{min_memory}M -Xmx{max_memory}M ')
-            f.write("-Dnogui=false " if use_gui else "-Dnogui=true ")
-            f.write("-jar server.jar\n" if use_gui else "-jar server.jar nogui\n")
-            f.write("pause\n")
-        print(f"成功建立 start.bat 檔案於 {bat_path}")
+        if server_type in ("NeoForge", "Forge"):
+            # NeoForge / Forge: 將記憶體設定寫入 user_jvm_args.txt
+            user_args_path = os.path.join(folder_path, "user_jvm_args.txt")
+            user_args_content = f"-Xms{min_memory}M\n-Xmx{max_memory}M\n"
+            try:
+                with open(user_args_path, "w", encoding="utf-8") as f:
+                    f.write(user_args_content)
+            except Exception as e:
+                print(f"[user_jvm_args.txt 寫入警告]: {e}")
+
+            # 檢查 run.bat 是否存在，如果自訂了 Java 路徑，則更新 run.bat 中的 java 調用
+            run_bat_path = os.path.join(folder_path, "run.bat")
+            if os.path.exists(run_bat_path) and java_path:
+                try:
+                    import re
+                    clean_java_path = os.path.normpath(java_path)
+                    with open(run_bat_path, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = f.readlines()
+                    with open(run_bat_path, "w", encoding="utf-8") as f:
+                        for line in lines:
+                            # 嚴格匹配行首的 java 命令 (忽略前面可能的空格)，避免誤傷註解
+                            if re.match(r'^\s*java\s+@', line):
+                                updated_line = re.sub(r'^\s*java\b', f'"{clean_java_path}"', line)
+                                f.write(updated_line)
+                            else:
+                                f.write(line)
+                except Exception as e:
+                    print(f"[run.bat 調整警告]: {e}")
+
+            # 判斷是新版 run.bat 還是舊版 forge.jar
+            bat_path = os.path.join(folder_path, "start.bat")
+            if os.path.exists(run_bat_path):
+                with open(bat_path, "w", encoding="utf-8") as f:
+                    f.write("@echo off\n")
+                    if use_gui:
+                        f.write("call run.bat\n")
+                    else:
+                        f.write("call run.bat nogui\n")
+                    f.write("pause\n")
+            else:
+                # 舊版 Forge (1.16.5 以前) 直接以 jar 啟動
+                forge_jars = [fn for fn in os.listdir(folder_path) if fn.startswith("forge-") and fn.endswith(".jar") and not fn.endswith("-installer.jar")]
+                target_jar = forge_jars[0] if forge_jars else "server.jar"
+                with open(bat_path, "w", encoding="utf-8") as f:
+                    f.write("@echo off\n")
+                    f.write(f'"{java_path if java_path else "java"}" -Xms{min_memory}M -Xmx{max_memory}M ')
+                    f.write("-Dnogui=false " if use_gui else "-Dnogui=true ")
+                    f.write(f"-jar {target_jar}\n" if use_gui else f"-jar {target_jar} nogui\n")
+                    f.write("pause\n")
+
+            print(f"成功建立 {server_type} 啟動腳本於 {bat_path}")
+
+        else:
+            bat_path = os.path.join(folder_path, "start.bat")
+            with open(bat_path, "w", encoding="utf-8") as f:
+                f.write("@echo off\n")
+                f.write(f'"{java_path if java_path else "java"}" -Xms{min_memory}M -Xmx{max_memory}M ')
+                f.write("-Dnogui=false " if use_gui else "-Dnogui=true ")
+                f.write("-jar server.jar\n" if use_gui else "-jar server.jar nogui\n")
+                f.write("pause\n")
+            print(f"成功建立 start.bat 檔案於 {bat_path}")
     except Exception as e:
         show_error("start.bat 錯誤", f"寫入 start.bat 失敗：{e}")
 
-# 下載伺服器 jar 檔（帶進度條的非同步版本）
-def download_server_jar_with_progress(folder_path, version, server_type, master, finish_callback):
+# 下載伺服器 jar 檔（帶進度條的非同步版本，支援 NeoForge 自動 --installServer 安裝）
+def download_server_jar_with_progress(folder_path, version, server_type, master, finish_callback, java_path=None):
     if not folder_path or not version:
         show_error("下載失敗", "請先選擇安裝路徑和版本")
         finish_callback(False)
@@ -416,6 +648,7 @@ def download_server_jar_with_progress(folder_path, version, server_type, master,
     def download_task():
         try:
             headers = {'User-Agent': 'Mozilla/5.0'}
+            jar_url = None
 
             if server_type == "Paper":
                 builds_url = f"https://fill.papermc.io/v3/projects/paper/versions/{version}/builds"
@@ -441,7 +674,7 @@ def download_server_jar_with_progress(folder_path, version, server_type, master,
                     on_finish(False)
                     return
 
-            else:  # Vanilla
+            elif server_type == "Vanilla":
                 manifest_url = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
                 manifest_response = requests.get(manifest_url, headers=headers)
                 manifest_response.raise_for_status()
@@ -469,8 +702,41 @@ def download_server_jar_with_progress(folder_path, version, server_type, master,
                     on_finish(False)
                     return
 
+            elif server_type == "NeoForge":
+                jar_url = get_neoforge_server_url(version)
+                if not jar_url:
+                    show_error("下載錯誤", f"無法取得 NeoForge {version} 的安裝檔下載連結")
+                    on_finish(False)
+                    return
+
+            elif server_type == "Forge":
+                jar_url = get_forge_server_url(version)
+                if not jar_url:
+                    show_error("下載錯誤", f"無法取得 Forge {version} 的安裝檔下載連結")
+                    on_finish(False)
+                    return
+
+            elif server_type == "Fabric":
+                jar_url = get_fabric_server_url(version)
+                if not jar_url:
+                    show_error("下載錯誤", f"無法取得 Fabric {version} 的伺服器下載連結")
+                    on_finish(False)
+                    return
+
+            else:
+                show_error("下載錯誤", f"不支援的伺服器類型: {server_type}")
+                on_finish(False)
+                return
+
             # 開始串流下載
-            label.configure(text=f"正在下載 {server_type} {version} 伺服器...")
+            label.configure(text=f"正在下載 {server_type} {version} 伺服器檔案...")
+            if server_type in ("NeoForge", "Forge"):
+                target_file_name = "installer.jar"
+            else:
+                target_file_name = "server.jar"
+
+            jar_path = os.path.join(folder_path, target_file_name)
+            
             session = requests.Session()
             retries = requests.adapters.Retry(
                 total=3,
@@ -480,7 +746,6 @@ def download_server_jar_with_progress(folder_path, version, server_type, master,
             adapter = requests.adapters.HTTPAdapter(max_retries=retries)
             session.mount('https://', adapter)
 
-            jar_path = os.path.join(folder_path, "server.jar")
             with session.get(jar_url, headers=headers, stream=True) as r:
                 r.raise_for_status()
                 total_length = int(r.headers.get('content-length', 0))
@@ -509,7 +774,41 @@ def download_server_jar_with_progress(folder_path, version, server_type, master,
                                     speed_label.configure(text=f"{downloaded_mb:.1f} MB 已下載  |  {speed_kb:.1f} KB/s")
                                 last_update_time = now
 
-            print(f"成功下載 {server_type} {version} 的伺服器檔案至 {jar_path}")
+            print(f"成功下載 {server_type} {version} 檔案至 {jar_path}")
+
+            # 若為 NeoForge 或 Forge，需在下載完成後執行 installer.jar --installServer 產生伺服器核心與函式庫
+            if server_type in ("NeoForge", "Forge"):
+                label.configure(text=f"正在安裝 {server_type} 伺服器函式庫與核心 (請稍候)...")
+                speed_label.configure(text="正在執行 --installServer，這可能需要一至兩分鐘...")
+                progress_bar.configure(mode="indeterminate")
+                progress_bar.start()
+
+                import subprocess
+                cmd_java = java_path if java_path else "java"
+                install_cmd = [cmd_java, "-jar", "installer.jar", "--installServer"]
+
+                creation_flags = 0
+                if sys.platform == "win32":
+                    creation_flags = subprocess.CREATE_NO_WINDOW
+
+                print(f"[{server_type} 安裝] 執行命令: {' '.join(install_cmd)} 在 {folder_path}")
+                res = subprocess.run(
+                    install_cmd,
+                    cwd=folder_path,
+                    capture_output=True,
+                    text=True,
+                    creationflags=creation_flags
+                )
+
+                if res.returncode != 0:
+                    err_msg = res.stderr or res.stdout or "未知錯誤"
+                    print(f"[{server_type} 安裝失敗]: {err_msg}")
+                    show_error(f"{server_type} 安裝失敗", f"執行 installer 安裝失敗：\n{err_msg[:500]}")
+                    on_finish(False)
+                    return
+
+                print(f"[{server_type} 安裝成功] 完成函式庫與啟動腳本建立")
+
             on_finish(True)
 
         except Exception as e:
@@ -568,7 +867,14 @@ def CreateGUI():
     label_type.grid(row=0, column=0, padx=(20, 10), pady=20, sticky="w")
 
     server_type_var = tk.StringVar(value="Paper")
-    server_type_dropdown = ctk.CTkOptionMenu(basic_tab, width=150, height=30, values=["Paper", "Vanilla"], variable=server_type_var, font=('微軟正黑體', 13))
+    server_type_dropdown = ctk.CTkOptionMenu(
+        basic_tab,
+        width=150,
+        height=30,
+        values=["Paper", "Vanilla", "NeoForge", "Forge", "Fabric"],
+        variable=server_type_var,
+        font=('微軟正黑體', 13)
+    )
     server_type_dropdown.grid(row=0, column=1, padx=(0, 20), pady=20, sticky="ew")
 
     label_version = ctk.CTkLabel(basic_tab, text="遊戲版本:", font=('微軟正黑體', 15, 'bold'))
@@ -578,10 +884,19 @@ def CreateGUI():
     version_dropdown.grid(row=2, column=1, padx=(0, 20), pady=20, sticky="ew")
 
     def update_versions(*args):
-        if server_type_var.get() == "Paper":
+        server_type = server_type_var.get()
+        if server_type == "Paper":
             versions = get_paper_versions()
-        else:
+        elif server_type == "Vanilla":
             versions = get_vanilla_versions()
+        elif server_type == "NeoForge":
+            versions = get_neoforge_versions()
+        elif server_type == "Forge":
+            versions = get_forge_versions()
+        elif server_type == "Fabric":
+            versions = get_fabric_versions()
+        else:
+            versions = []
         version_dropdown.configure_values(versions)
         version_dropdown.set("請選擇版本")
 
@@ -807,22 +1122,22 @@ def on_create_server():
     # 進行伺服器建立流程
     def continue_setup(java_path):
         try:
-            create_start_bat(folder, min_mem, max_mem, use_gui, java_path)
-            create_or_update_eula_file(agree_eula, folder)
             server_type = server_type_var.get()
-            status_var.set("正在下載伺服器檔案...")
+            create_or_update_eula_file(agree_eula, folder)
+            status_var.set("正在下載並準備伺服器核心檔案...")
 
             def on_jar_downloaded(success):
                 if success:
                     try:
+                        create_start_bat(folder, min_mem, max_mem, use_gui, java_path, server_type)
                         create_server_properties(folder, online_mode, max_players, pvp, server_port)
                         setup_finished(True)
                     except Exception as e:
                         setup_finished(False, f"建立伺服器設定時發生錯誤：{e}")
                 else:
-                    setup_finished(False, "伺服器 JAR 下載失敗，無法繼續架設")
+                    setup_finished(False, "伺服器核心下載或安裝失敗，無法繼續架設")
 
-            download_server_jar_with_progress(folder, version, server_type, win, on_jar_downloaded)
+            download_server_jar_with_progress(folder, version, server_type, win, on_jar_downloaded, java_path)
         except Exception as e:
             setup_finished(False, f"建立伺服器時發生錯誤：{e}")
 
